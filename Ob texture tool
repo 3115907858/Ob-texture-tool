@@ -1,0 +1,496 @@
+import os
+from datetime import datetime
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
+import cv2
+import numpy as np
+from PIL import Image
+
+
+class TextureProcessor(ctk.CTk):
+    CHANNEL_CONFIG = {
+        "split": {
+            "nnr": {"channels": (3, 4), "components": ["N", "R"]},
+            "nnrm": {"channels": 4, "components": ["N", "R", "M"]},
+            "nnre": {"channels": 4, "components": ["N", "R", "E"]},
+            "nnrs": {"channels": 4, "components": ["N", "R", "S"]},
+            "nnrao": {"channels": 4, "components": ["N", "R", "AO"]},
+            "nnaoo": {"channels": 4, "components": ["N", "Ao", "O"]}
+        },
+        "merge": {
+            "nnr": {"suffix": "NNR", "components": ["N", "R"], "channels": ["R", "G", "B", "A"]},
+            "nnrm": {"suffix": "NNRM", "components": ["N", "R", "M"], "channels": ["R", "G", "B", "A"]},
+            "nnre": {"suffix": "NNRE", "components": ["N", "R", "E"], "channels": ["R", "G", "B", "A"]},
+            "nnrs": {"suffix": "NNRS", "components": ["N", "R", "S"], "channels": ["R", "G", "B", "A"]},
+            "nnrao": {"suffix": "NNRAO", "components": ["N", "R", "AO"], "channels": ["R", "G", "B", "A"]},
+            "nnaoo": {"suffix": "NNAoO", "components": ["N", "Ao", "O"], "channels": ["R", "G", "B", "A"]}
+        }
+    }
+
+    CHANNEL_LABELS = {
+        "N": "Normal", "R": "Roughness", "M": "Metallic",
+        "E": "Emissive", "AO": "AO", "S": "Specular",
+        "Ao": "AO", "O": "Opacity"
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.image_references = {}
+        self.merge_components = {}
+        self._init_ui()
+        self._setup_bindings()
+
+    def _init_ui(self):
+        self.title("Texture Processor v2.0")
+        self.geometry("1280x820")
+        self.minsize(1200, 780)
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("blue")
+
+        self.grid_rowconfigure(3, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self._create_mode_selector()
+        self._create_type_selector()
+        self._create_file_interface()
+        self._create_log_console()
+        self._create_process_button()
+
+    def _setup_bindings(self):
+        self.mode_var.trace_add("write", lambda var, index, mode: self._update_interface())
+        self.map_type_var.trace_add("write", lambda var, index, mode: self._update_interface())
+
+    def _create_mode_selector(self):
+        mode_frame = ctk.CTkFrame(self, corner_radius=8)
+        mode_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+
+        ctk.CTkLabel(mode_frame, text="Operation Mode:",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=10, pady=5)
+        self.mode_var = ctk.StringVar(value="split")
+        for col, (text, value) in enumerate([("Split Textures", "split"), ("Merge Textures", "merge")]):
+            ctk.CTkRadioButton(mode_frame, text=text, variable=self.mode_var,
+                               value=value).grid(row=0, column=col + 1, padx=10)
+
+    def _create_type_selector(self):
+        type_frame = ctk.CTkFrame(self, corner_radius=8)
+        type_frame.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
+
+        ctk.CTkLabel(type_frame, text="Texture Type:",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=10, pady=5)
+        self.map_type_var = ctk.StringVar(value="nnrm")
+        for col, (text, value) in enumerate(self._get_type_options()):
+            ctk.CTkRadioButton(type_frame, text=text, variable=self.map_type_var,
+                               value=value).grid(row=0, column=col + 1, padx=5, pady=2)
+
+    def _create_file_interface(self):
+        self.file_frame = ctk.CTkFrame(self, corner_radius=8)
+        self.file_frame.grid(row=2, column=0, padx=20, pady=10, sticky="nsew")
+        self.file_frame.grid_columnconfigure(0, weight=1)
+
+        if self.mode_var.get() == "split":
+            self._create_split_ui()
+        else:
+            self._create_merge_ui()
+
+    def _create_log_console(self):
+        log_frame = ctk.CTkFrame(self, corner_radius=8)
+        log_frame.grid(row=3, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(0, weight=1)
+
+        self.log_text = ctk.CTkTextbox(log_frame, wrap="word", font=("Consolas", 12), state="disabled")
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+    def _create_process_button(self):
+        self.process_btn = ctk.CTkButton(self, text="Start Processing",
+                                         font=ctk.CTkFont(size=14, weight="bold"),
+                                         height=50, command=self._process_files)
+        self.process_btn.grid(row=5, column=0, padx=20, pady=(0, 20), sticky="ew")
+
+    def _update_interface(self):
+        for widget in self.file_frame.winfo_children():
+            widget.destroy()
+
+        self.file_frame.grid_columnconfigure(0, weight=1)
+
+        if self.mode_var.get() == "split":
+            self._create_split_ui()
+        else:
+            self._create_merge_ui()
+        self.update_idletasks()
+
+    def _create_split_ui(self):
+        entry_frame = ctk.CTkFrame(self.file_frame, fg_color="transparent")
+        entry_frame.pack(fill="x", expand=True, padx=10, pady=10)
+
+        entry_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(entry_frame, text="Source Texture:", width=120, anchor="w").grid(row=0, column=0)
+        self.split_input_entry = ctk.CTkEntry(entry_frame, placeholder_text="Select texture to split")
+        self.split_input_entry.grid(row=0, column=1, padx=5, sticky="ew")
+
+        browse_btn = ctk.CTkButton(entry_frame, text="Browse", width=80,
+                                   command=lambda: self._select_file(self.map_type_var.get()))
+        browse_btn.grid(row=0, column=2, padx=5)
+
+        self.split_thumbnail = ctk.CTkLabel(entry_frame, text="", width=64, height=64,
+                                            fg_color=("gray85", "gray25"), corner_radius=4)
+        self.split_thumbnail.grid(row=0, column=3, padx=5)
+
+        option_frame = ctk.CTkFrame(self.file_frame, corner_radius=8)
+        option_frame.pack(padx=10, pady=5, fill="x")
+
+        self.b_channel_var = ctk.StringVar(value="white")
+        ctk.CTkLabel(option_frame, text="B-Channel Handling:").grid(row=0, column=0, padx=5, pady=5)
+        for col, (text, value) in enumerate([("Fill White", "white"), ("Calculate Z", "calculate_z")]):
+            ctk.CTkRadioButton(option_frame, text=text, variable=self.b_channel_var,
+                               value=value).grid(row=0, column=col + 1, padx=5)
+
+    def _create_merge_ui(self):
+        self.merge_components = {}
+        config = self.CHANNEL_CONFIG["merge"][self.map_type_var.get()]
+
+        for row, suffix in enumerate(config["components"]):
+            self._create_merge_component(suffix, row)
+
+    def _create_merge_component(self, suffix, row):
+        entry_frame = ctk.CTkFrame(self.file_frame, fg_color="transparent")
+        entry_frame.grid(row=row, column=0, padx=5, pady=3, sticky="ew")
+        entry_frame.grid_columnconfigure(1, weight=1)
+
+        label = f"{self.CHANNEL_LABELS[suffix]} Map ({suffix})"
+        ctk.CTkLabel(entry_frame, text=label, width=140, anchor="w").grid(row=0, column=0, padx=5)
+
+        entry = ctk.CTkEntry(entry_frame, placeholder_text=f"Select {label} file")
+        entry.grid(row=0, column=1, padx=5, sticky="ew")
+
+        browse_btn = ctk.CTkButton(entry_frame, text="Browse", width=80,
+                                   command=lambda s=suffix: self._select_file(s))
+        browse_btn.grid(row=0, column=2, padx=5)
+
+        thumbnail = ctk.CTkLabel(entry_frame, text="", width=64, height=64,
+                                 fg_color=("gray85", "gray25"), corner_radius=4)
+        thumbnail.grid(row=0, column=3, padx=5)
+
+        self.merge_components[suffix] = {"entry": entry, "thumbnail": thumbnail}
+
+    def _process_files(self):
+        try:
+            self.log_message("\n🌀 Starting processing...", "INFO")
+            if self.mode_var.get() == "split":
+                self._split_processor()
+            else:
+                self._merge_processor()
+            messagebox.showinfo("Processing Complete", "All operations completed successfully!")
+            self.log_message("✅ Processing completed successfully", "SUCCESS")
+        except Exception as e:
+            messagebox.showerror("Processing Error", str(e))
+            self.log_message(f"❌ Critical error: {str(e)}", "ERROR")
+
+    def _split_processor(self):
+        input_path = self.split_input_entry.get().strip()
+        self._validate_path(input_path, expected_suffix=self.map_type_var.get(), mode="split")
+
+        map_type = self.map_type_var.get()
+        config = self.CHANNEL_CONFIG["split"][map_type]
+
+        self.log_message(f"📂 Loading source texture: {os.path.basename(input_path)}", "INFO")
+        self.log_message(f"🔧 Processing as {map_type.upper()} type", "INFO")
+
+        img = self._load_image(input_path)
+        self.log_message(f"📐 Image dimensions: {img.shape[1]}x{img.shape[0]}", "INFO")
+
+        self._validate_channel_count(img, config["channels"])
+        self.log_message(f"✅ Validated channel count: {img.shape[2]}", "SUCCESS")
+
+        components = self._split_components(img, map_type)
+        self._save_components(input_path, components, config["components"])
+
+    def _save_components(self, input_path, components, suffixes):
+        base_dir = os.path.dirname(input_path)
+        base_name = os.path.splitext(os.path.basename(input_path))[0].rsplit('_', 1)[0]
+
+        output_paths = [os.path.join(base_dir, f"{base_name}_{suffix}.png") for suffix in suffixes]
+
+        existing_files = [p for p in output_paths if os.path.exists(p)]
+        if existing_files:
+            file_list = "\n".join([os.path.basename(p) for p in existing_files])
+            response = messagebox.askyesno(
+                "File Exists",
+                f"The following files already exist:\n{file_list}\n\nOverwrite them?",
+                parent=self
+            )
+            if not response:
+                self.log_message("🚫 Process canceled by user", "WARNING")
+                return
+
+        for suffix in suffixes:
+            output_path = os.path.join(base_dir, f"{base_name}_{suffix}.png")
+            if suffix == "N":
+                cv2.imwrite(output_path, cv2.cvtColor(components[suffix], cv2.COLOR_RGB2BGR))
+            else:
+                cv2.imwrite(output_path, components[suffix])
+            self.log_message(f"💾 Saved {suffix} map: {os.path.basename(output_path)}", "SUCCESS")
+
+    def _split_components(self, img, map_type):
+        channels = cv2.split(img)
+        components = {}
+        config = self.CHANNEL_CONFIG["split"][map_type]
+
+        self.log_message("🛠 Processing Normal map...", "INFO")
+        normal_x = channels[0]
+        normal_y = channels[1]
+        components["N"] = self._create_normal_map(normal_x, normal_y)
+        self.log_message(f"🔵 B-channel handling: {self.b_channel_var.get().replace('_', ' ').title()}", "INFO")
+
+        if map_type == "nnaoo":
+            self.log_message("🛠 Processing AO and Opacity channels...", "INFO")
+            components["Ao"] = channels[2]
+            components["O"] = channels[3]
+        else:
+            self.log_message("🛠 Processing Roughness channel...", "INFO")
+            components["R"] = channels[2]
+
+            if len(channels) > 3 and len(config["components"]) > 2:
+                components[config["components"][2]] = channels[3]
+
+        return components
+
+    def _create_normal_map(self, x_channel, y_channel):
+        if self.b_channel_var.get() == "white":
+            b_channel = np.full_like(x_channel, 255)
+        else:
+            x = (x_channel.astype(np.float32) / 255.0) * 2 - 1
+            y = (y_channel.astype(np.float32) / 255.0) * 2 - 1
+            z = np.sqrt(np.clip(1.0 - x ** 2 - y ** 2, 0.0, 1.0))
+            b_channel = ((z + 1.0) * 127.5).astype(np.uint8)
+
+        return cv2.merge([x_channel, y_channel, b_channel])
+
+    def _merge_processor(self):
+        map_type = self.map_type_var.get()
+        config = self.CHANNEL_CONFIG["merge"][map_type]
+
+        self.log_message(f"🔧 Merging as {map_type.upper()} type", "INFO")
+        components = self._load_merge_components(config["components"])
+        merged = self._merge_components(components, map_type)
+
+        self.log_message(f"📐 Merged dimensions: {merged.shape[1]}x{merged.shape[0]}", "INFO")
+        self.log_message(f"🌈 Merged channels: {merged.shape[2]}", "INFO")
+
+        output_path = self._generate_merge_output_path(config["suffix"])
+
+        if os.path.exists(output_path):
+            response = messagebox.askyesno(
+                "File Exists",
+                f"The file {os.path.basename(output_path)} already exists. Overwrite it?",
+                parent=self
+            )
+            if not response:
+                self.log_message("🚫 Process canceled by user", "WARNING")
+                return
+
+        self._save_merged_image(merged, output_path)
+
+    def _load_merge_components(self, required_components):
+        components = {}
+        base_size = None
+
+        for suffix in required_components:
+            path = self.merge_components[suffix]["entry"].get().strip()
+            if not path:
+                raise ValueError(f"Missing {suffix} map")
+
+            self.log_message(f"📂 Loading {self.CHANNEL_LABELS[suffix]} map...", "INFO")
+            self._validate_path(path, suffix, "merge")
+            components[suffix] = self._load_component(path, suffix)
+
+            if base_size is None:
+                base_size = components[suffix].shape[:2]
+                self.log_message(f"📏 Base size set to {base_size[1]}x{base_size[0]}", "INFO")
+            elif components[suffix].shape[:2] != base_size:
+                self.log_message("🔄 Resizing component to match base dimensions", "INFO")
+                components[suffix] = cv2.resize(components[suffix], (base_size[1], base_size[0]))
+
+        return components
+
+    def _merge_components(self, components, map_type):
+        base_height, base_width = components["N"].shape[:2]
+        merged = np.zeros((base_height, base_width, 4), dtype=np.uint8)
+
+        merged[:, :, 0] = components["N"][:, :, 0]
+        merged[:, :, 1] = components["N"][:, :, 1]
+
+        if map_type == "nnaoo":
+            merged[:, :, 2] = components["Ao"]
+            merged[:, :, 3] = components["O"]
+        else:
+            merged[:, :, 2] = components["R"]
+
+            if map_type == "nnr":
+                merged[:, :, 3] = 255
+            elif len(components) > 2:
+                third_component = self.CHANNEL_CONFIG["merge"][map_type]["components"][2]
+                merged[:, :, 3] = components[third_component]
+
+        return merged
+
+    def _process_image(self, img):
+        if img.dtype == np.uint16:
+            self.log_message("🔍 Detected 16-bit image, converting to 8-bit", "INFO")
+            return (img / 256).astype(np.uint8)
+        return img
+
+    def _load_image(self, path):
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError(f"Failed to load image: {path}")
+
+        img = self._process_image(img)
+
+        if len(img.shape) == 3 and img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        elif len(img.shape) == 3 and img.shape[2] == 3:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
+    def _load_component(self, path, suffix):
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError(f"Failed to load {suffix} component: {path}")
+
+        img = self._process_image(img)
+
+        if suffix == "N":
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            if len(img.shape) == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            return img
+
+    def _save_merged_image(self, image, output_path):
+        pil_image = Image.fromarray(image, 'RGBA' if image.shape[2] == 4 else 'RGB')
+        pil_image.save(output_path)
+        self.log_message(f"💾 Merged texture saved: {os.path.basename(output_path)}", "SUCCESS")
+
+    def _generate_merge_output_path(self, suffix):
+        n_file_path = self.merge_components["N"]["entry"].get()
+        base_name = os.path.basename(n_file_path).split('_N.')[0]
+        return os.path.join(os.path.dirname(n_file_path), f"{base_name}_{suffix}.png")
+
+    def _validate_path(self, path, expected_suffix=None, mode=None):
+        if not path:
+            raise ValueError("Please select input file")
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
+
+        if mode == "split" and expected_suffix:
+            if not path.lower().endswith(f"_{expected_suffix.lower()}.png"):
+                raise ValueError(f"Invalid input file name, expected *_{expected_suffix}.png")
+        elif mode == "merge" and expected_suffix:
+            if not path.lower().endswith(f"_{expected_suffix.lower()}.png"):
+                raise ValueError(
+                    f"Invalid file suffix for {expected_suffix} map. Expected filename ending with '_{expected_suffix}.png'")
+
+    def _validate_channel_count(self, img, expected):
+        actual = img.shape[2] if img.ndim == 3 else 1
+        expected_values = expected if isinstance(expected, tuple) else (expected,)
+
+        if actual not in expected_values:
+            expected_str = " or ".join(str(e) for e in expected_values)
+            raise ValueError(f"Channel count mismatch: Expected {expected_str}, got {actual}.")
+
+    def _select_file(self, expected_suffix):
+        current_type = self.map_type_var.get()
+        mode = self.mode_var.get()
+
+        filetypes = self._get_filetypes(mode, expected_suffix, current_type)
+        path = filedialog.askopenfilename(filetypes=filetypes)
+
+        if not path:
+            return
+
+        try:
+            self._validate_path(path, expected_suffix, mode)
+            self._update_file_entry(path, expected_suffix)
+        except Exception as e:
+            messagebox.showerror("Invalid File", str(e))
+            self.log_message(f"⚠️ File selection error: {str(e)}", "WARNING")
+
+    def _update_file_entry(self, path, suffix):
+        if self.mode_var.get() == "split":
+            self.split_input_entry.delete(0, ctk.END)
+            self.split_input_entry.insert(0, path)
+            self._update_thumbnail(path, self.split_thumbnail)
+        else:
+            self.merge_components[suffix]["entry"].delete(0, ctk.END)
+            self.merge_components[suffix]["entry"].insert(0, path)
+            self._update_thumbnail(path, self.merge_components[suffix]["thumbnail"])
+
+    def _update_thumbnail(self, path, label):
+        try:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise ValueError("Invalid image file or unsupported format")
+
+            img = self._process_image(img)
+            thumbnail = cv2.resize(img, (64, 64))
+
+            if len(thumbnail.shape) == 2:
+                thumbnail = cv2.cvtColor(thumbnail, cv2.COLOR_GRAY2BGR)
+            elif thumbnail.shape[2] == 4:
+                thumbnail = cv2.cvtColor(thumbnail, cv2.COLOR_BGRA2BGR)
+
+            thumbnail = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB)
+            thumbnail = cv2.copyMakeBorder(thumbnail, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=(100, 100, 100))
+
+            pil_image = Image.fromarray(thumbnail)
+            ctk_image = ctk.CTkImage(light_image=pil_image, size=(68, 68))
+
+            self.image_references[label] = ctk_image
+            label.configure(image=ctk_image, text="")
+        except Exception as e:
+            self.log_message(f"Thumbnail Error: {str(e)}", "ERROR")
+            label.configure(image=None, text="Preview\nError")
+
+    def _get_type_options(self):
+        return [
+            ("NNRM (Metallic)", "nnrm"),
+            ("NNRE (Emissive)", "nnre"),
+            ("NNR (Base)", "nnr"),
+            ("NNRAO (AO)", "nnrao"),
+            ("NNRS (Specular)", "nnrs"),
+            ("NNAoO (AO+Opacity)", "nnaoo")
+        ]
+
+    def _get_filetypes(self, mode, suffix, map_type):
+        if mode == "split":
+            expected_suffix = f"*_{map_type}.png"
+            return [(f"{map_type.upper()} Texture", expected_suffix), ("All Files", "*.*")]
+        return [(f"{self.CHANNEL_LABELS.get(suffix, 'Unknown')} Map", f"*_{suffix}.png"), ("All Files", "*.*")]
+
+    def log_message(self, message, level="INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        colors = {
+            "INFO": "#AAAAAA",
+            "WARNING": "#FFCC00",
+            "ERROR": "#FF4444",
+            "SUCCESS": "#44FF44"
+        }
+
+        self.log_text.configure(state="normal")
+        self.log_text.insert(ctk.END, f"[{timestamp}] ", ("timestamp", level))
+        self.log_text.insert(ctk.END, f"{message}\n", level)
+        self.log_text.tag_config("timestamp", foreground="#666666")
+        self.log_text.tag_config(level, foreground=colors[level])
+        self.log_text.see(ctk.END)
+        self.log_text.configure(state="disabled")
+
+
+if __name__ == "__main__":
+    app = TextureProcessor()
+    app.mainloop()
